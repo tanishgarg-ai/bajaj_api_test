@@ -1,26 +1,30 @@
 import os
 import math
 import asyncio
-import time
+import traceback
+import re
 from typing import List, Union, Optional
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from google import genai
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Configuration
+# Config
 EMAIL = os.getenv("EMAIL", "your-email@example.com")
 API_KEY = os.getenv("GEMINI_KEY")
 
+# Check API Key immediately
 if not API_KEY:
-    raise ValueError("GEMINI_KEY not found in environment variables")
-
-# Initialize the modern Gemini Async Client
-# Note: .aio provides the asynchronous interface
-client = genai.Client(api_key=API_KEY).aio
+    print("CRITICAL ERROR: GEMINI_KEY is missing from environment variables.")
+    client = None
+else:
+    try:
+        client = genai.Client(api_key=API_KEY).aio
+    except Exception as e:
+        print(f"CRITICAL ERROR: Failed to initialize Gemini Client: {e}")
+        client = None
 
 app = FastAPI(title="Math & AI API")
 
@@ -71,31 +75,49 @@ def calculate_hcf(arr: List[int]) -> int:
     return h
 
 
-# --- AI Logic with Retry Mechanism ---
 
 async def generate_ai_response(prompt: str):
-    """Generates content using Gemini with exponential backoff retries."""
-    retries = 5
-    for i in range(retries):
+    """Generates content with fallback from 2.0-flash to 1.5-flash on quota errors."""
+    if client is None:
+        raise HTTPException(status_code=503, detail="Gemini Client not initialized.")
+
+    # Try 2.0 first, then 1.5 if 2.0 is exhausted
+    models_to_try = ["gemini-3-flash-preview", "gemini-2.0-flash"]
+    last_exception = None
+
+    # System instruction to enforce the one-word rule
+    system_instruction = "You are a helpful assistant. You must respond to every user query with exactly one word. No punctuation, no sentences, just one single word."
+
+    for model_name in models_to_try:
         try:
             response = await client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt
+                model=model_name,
+                contents=prompt,
+                config={
+                    "system_instruction": system_instruction
+                }
             )
-            return response.text.strip()
+            # Ensure we only return the first word if the model happens to ignore the instruction
+            result = response.text.strip().split()
+            return result[0] if result else "N/A"
+
         except Exception as e:
-            if i == retries - 1:
-                raise e
-            # Exponential backoff: 1s, 2s, 4s, 8s, 16s
-            await asyncio.sleep(2 ** i)
-    return None
+            err_str = str(e)
+            # If it's a rate limit error, we check if we should try the next model
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                print(f"Quota exhausted for {model_name}. Trying fallback...")
+                last_exception = e
+                continue
+            raise e  # Raise immediately if it's a different kind of error (e.g. invalid key)
+
+    # If all models fail, raise the last quota error
+    raise last_exception
 
 
 # --- API Endpoints ---
 
 @app.post("/bfhl")
 async def bfhl(data: InputData):
-    # Get only the fields that were actually sent in the request
     provided_fields = data.model_dump(exclude_unset=True)
 
     if len(provided_fields) != 1:
@@ -107,16 +129,12 @@ async def bfhl(data: InputData):
     try:
         if key == "fibonacci":
             result = calculate_fibonacci(data.fibonacci)
-
         elif key == "prime":
             result = filter_primes(data.prime)
-
         elif key == "lcm":
             result = calculate_lcm(data.lcm)
-
         elif key == "hcf":
             result = calculate_hcf(data.hcf)
-
         elif key == "AI":
             result = await generate_ai_response(data.AI)
 
@@ -127,8 +145,24 @@ async def bfhl(data: InputData):
         }
 
     except Exception as e:
-        # Log the error internally here if needed
-        raise HTTPException(status_code=500, detail="Internal Server Error processing the request.")
+        err_msg = str(e)
+
+        # Specific handling for Quota/Rate Limit Errors
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            # Try to extract the wait time from the error message using regex
+            wait_match = re.search(r"retry in ([\d\.]+)s", err_msg)
+            wait_time = wait_match.group(1) if wait_match else "a few seconds"
+
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Please retry in {wait_time}s. Consider switching to a paid plan or waiting for the quota to reset."
+            )
+
+        print("--- EXCEPTION CAUGHT IN /BFHL ---")
+        traceback.print_exc()
+        print("---------------------------------")
+
+        raise HTTPException(status_code=500, detail=f"Internal Error: {err_msg}")
 
 
 @app.get("/health")
@@ -136,7 +170,8 @@ async def health():
     return {
         "is_success": True,
         "official_email": EMAIL,
-        "status": "online"
+        "status": "online",
+        "gemini_ready": client is not None
     }
 
 
